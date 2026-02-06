@@ -1,34 +1,61 @@
 // Copyright Finbuckle LLC, Andrew White, and Contributors.
 // Refer to the solution LICENSE file for more information.
 
-using Finbuckle.MultiTenant.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Metadata.Builders;
-using System;
-using System.Linq;
 using System.Linq.Expressions;
+using Finbuckle.MultiTenant.Abstractions;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
-// ReSharper disable once CheckNamespace
-namespace Finbuckle.MultiTenant;
+namespace Finbuckle.MultiTenant.EntityFrameworkCore.Extensions;
 
+/// <summary>
+/// Extension methods for configuring multi-tenant entity types.
+/// </summary>
 public static class EntityTypeBuilderExtensions
 {
     private class ExpressionVariableScope
     {
+        // ReSharper disable once UnassignedGetOnlyAutoProperty
         public IMultiTenantDbContext? Context { get; }
     }
 
-    private static LambdaExpression? GetQueryFilter(this EntityTypeBuilder builder)
+    /// <summary>
+    /// Marks an entity as non-multi-tenant, removing any tenant-based query filters.
+    /// </summary>
+    /// <param name="builder">The <see cref="EntityTypeBuilder"/> instance.</param>
+    /// <returns>The same <see cref="EntityTypeBuilder"/> instance for method chaining.</returns>
+    /// <remarks>
+    /// This method is useful for excluding specific entities from tenant isolation in a multi-tenant context.
+    /// It sets the multi-tenant annotation to false, removes the Tenant Id shadow property if applicable, and removes the tenant query filter if it exists.
+    /// </remarks>
+    public static EntityTypeBuilder IsNotMultiTenant(this EntityTypeBuilder builder)
     {
-        return builder.Metadata.GetQueryFilter();
+        if (builder.Metadata.FindAnnotation(Constants.MultiTenantAnnotationName) is IAnnotation { Value: true })
+        {
+            // remove the multi-tenant annotation
+            builder.Metadata.SetAnnotation(Constants.MultiTenantAnnotationName, false);
+
+            // remove the shadow tenant id property if it exists
+            if (builder.Metadata.GetProperty("TenantId") is var property && property.IsShadowProperty())
+                builder.Metadata.RemoveProperty(property);
+
+
+            // remove the named query filter if it exists
+            var existingFilter = builder.Metadata.FindDeclaredQueryFilter(Abstractions.Constants.TenantToken);
+            if (existingFilter is not null)
+                builder.Metadata.SetQueryFilter(Abstractions.Constants.TenantToken, null);
+        }
+
+        return builder;
     }
 
     /// <summary>
-    /// Adds MultiTenant support for an entity. Call <see cref="IsMultiTenant" /> after
-    /// <see cref="EntityTypeBuilder.HasQueryFilter" /> to merge query filters.
+    /// Adds multi-tenant support for an entity via a named query filter.
     /// </summary>
-    /// <param name="builder">The typed EntityTypeBuilder instance.</param>
-    /// <returns>A MultiTenantEntityTypeBuilder instance.</returns>
+    /// <param name="builder">The typed <see cref="EntityTypeBuilder"/> instance.</param>
+    /// <returns>A <see cref="MultiTenantEntityTypeBuilder"/> instance.</returns>
+    /// <remarks>A string property named TenantId is used in the query filter. If one does not already exist on the entity a shadow property is used.</remarks>
     public static MultiTenantEntityTypeBuilder IsMultiTenant(this EntityTypeBuilder builder)
     {
         if (builder.Metadata.IsMultiTenant())
@@ -38,9 +65,7 @@ public static class EntityTypeBuilderExtensions
 
         try
         {
-            builder.Property<string>("TenantId")
-                .IsRequired()
-                .HasMaxLength(Internal.Constants.TenantIdMaxLength);
+            builder.Property<string>("TenantId").IsRequired();
         }
         catch (Exception ex)
         {
@@ -52,14 +77,6 @@ public static class EntityTypeBuilderExtensions
         // where e is one of our entity types
         // will need this ParameterExpression for next step and for final step
         var entityParamExp = Expression.Parameter(builder.Metadata.ClrType, "e");
-
-        var existingQueryFilter = builder.GetQueryFilter();
-
-        // override to match existing query parameter if applicable
-        if (existingQueryFilter != null)
-        {
-            entityParamExp = existingQueryFilter.Parameters.First();
-        }
 
         // build up expression tree for: EF.Property<string>(e, "TenantId")
         var tenantIdExp = Expression.Constant("TenantId", typeof(string));
@@ -74,43 +91,52 @@ public static class EntityTypeBuilderExtensions
         var contextTenantInfoExp = Expression.Property(contextMemberAccessExp, nameof(IMultiTenantDbContext.TenantInfo));
 
         #region Fork Sirfull
-
+        // Original code
         // this code will generate this expression : EF.Property<string>(e, "TenantId") == TenantInfo.Id
         // var rightExp = Expression.Property(contextTenantInfoExp, nameof(IMultiTenantDbContext.TenantInfo.Id));
 
-        // the previous instruction is replaced by this one
-        // which will generate this expression : EF.Property<string>(e, "TenantId") == (TenantInfo != null ? TenantInfo.Id : "")
-        var rightExp = Expression.Condition(Expression.NotEqual(contextTenantInfoExp, Expression.Constant(null)),
-            Expression.Property(contextTenantInfoExp, nameof(IMultiTenantDbContext.TenantInfo.Id)),
-            Expression.Constant(string.Empty, typeof(string))
+        // On récupère toujours les entités avec TenantId = "*" car elles sont considérées comme des entités globales (non multi-tenant)
+
+        // Generate expression: IsMultiTenantEnabled == False 
+        var multiTenantDisabled = Expression.Equal(Expression.Property(contextMemberAccessExp, nameof(IMultiTenantDbContext.IsMultiTenantEnabled)), Expression.Constant(false));
+
+        // Generate expression:  EF.Property<string>(e, "TenantId") == "*"
+        var tenantIdIsWildcard = Expression.Equal(leftExp, Expression.Constant("*", typeof(string)));
+
+        // Generate expression: TenantInfo == null
+        var tenantInfoIsNull = Expression.Equal(contextTenantInfoExp, Expression.Constant(null));
+
+        // Generate expression: EF.Property<string>(e, "TenantId") == TenantInfo == null ? "*" : TenantInfo.Id
+        var rightExp = Expression.Condition(
+            Expression.Equal(contextTenantInfoExp, Expression.Constant(null)),
+            Expression.Constant("*", typeof(string)),
+            Expression.Property(contextTenantInfoExp, nameof(IMultiTenantDbContext.TenantInfo.Id))
         );
+        var tenantIdEqualsInfo = Expression.Equal(leftExp, rightExp);
 
-        // build expression tree for EF.Property<string>(e, "TenantId") == (TenantInfo != null ? TenantInfo.Id : "")
-        var predicate = Expression.Equal(leftExp, rightExp);
-
-        // build expression tree for : IsMultiTenantEnabled == False || EF.Property<string>(e, "TenantId") == (TenantInfo != null ? TenantInfo.Id : "")
-        //                              -------------------------------
-        predicate = Expression.OrElse(
-            Expression.Equal(
-                Expression.Property(contextMemberAccessExp, nameof(IMultiTenantDbContext.IsMultiTenantEnabled)),
-                Expression.Constant(false)
-            ),
-            predicate
+        // Build the complete predicate with OR conditions
+        //  IsMultiTenantEnabled == False 
+        //   || EF.Property<string>(e, "TenantId") == "*"
+        //   || TenantInfo == null
+        //   || EF.Property<string>(e, "TenantId") == TenantInfo == null ? "*" : TenantInfo.Id
+        var predicate = Expression.OrElse(
+            multiTenantDisabled,
+            Expression.OrElse(
+                tenantIdIsWildcard,
+                Expression.OrElse(
+                    tenantInfoIsNull,
+                    tenantIdEqualsInfo
+                )
+            )
         );
         #endregion
-
-        // combine with existing filter
-        if (existingQueryFilter != null)
-        {
-            predicate = Expression.AndAlso(existingQueryFilter.Body, predicate);
-        }
 
         // build the final expression tree
         var delegateType = Expression.GetDelegateType(builder.Metadata.ClrType, typeof(bool));
         var lambdaExp = Expression.Lambda(delegateType, predicate, entityParamExp);
 
         // set the filter
-        builder.HasQueryFilter(lambdaExp);
+        builder.HasQueryFilter(Abstractions.Constants.TenantToken, lambdaExp);
 
         return new MultiTenantEntityTypeBuilder(builder);
     }
